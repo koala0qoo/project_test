@@ -32,10 +32,10 @@ mpl.rcParams['axes.unicode_minus'] = False
 slim = tf.contrib.slim
 
 tf.app.flags.DEFINE_integer(
-    'batch_size', 20, 'The number of samples in each batch.')
+    'batch_size', 24, 'The number of samples in each batch.')
 
 tf.app.flags.DEFINE_integer(
-    'max_num_batches', 10,
+    'max_num_batches', 200,
     'Max number of batches to evaluate by default use all.')
 
 tf.app.flags.DEFINE_string(
@@ -50,7 +50,7 @@ tf.app.flags.DEFINE_string(
     'output_file', '/tmp/tfmodel/', 'Directory where the results are saved to.')
 
 tf.app.flags.DEFINE_integer(
-    'num_preprocessing_threads', 4,
+    'num_preprocessing_threads', 1,
     'The number of threads used to create the batches.')
 
 tf.app.flags.DEFINE_string(
@@ -101,28 +101,18 @@ def main(_):
     ####################
 
     filename_queue = tf.train.string_input_producer(
-        [os.path.join(FLAGS.dataset_dir, 'pj_vehicle_test.tfrecord')], )
+        [FLAGS.dataset_dir + '/pj_vehicle_validation_0000%d-of-00004.tfrecord' % i for i in range(0, 4)], )
     reader = tf.TFRecordReader()
     _, serialized_example = reader.read(filename_queue)
 
     features = tf.parse_single_example(serialized_example,
                                        features={
+                                           'image/class/label': tf.FixedLenFeature([], tf.int64),
                                            'image/encoded': tf.FixedLenFeature([], tf.string),
-                                           'image/object/bbox/xmin': tf.FixedLenFeature([], tf.float32),
-                                           'image/object/bbox/xmax': tf.FixedLenFeature([], tf.float32),
-                                           'image/object/bbox/ymin': tf.FixedLenFeature([], tf.float32),
-                                           'image/object/bbox/ymax': tf.FixedLenFeature([], tf.float32),
-                                           'image/object/class/text': tf.FixedLenFeature([], tf.string),
-                                           'image/object/class/label': tf.FixedLenFeature([], tf.int64),
                                        })
 
     image = features['image/encoded']
-    label = features['image/object/class/label']
-    ymin = features['image/object/bbox/ymin']
-    xmin = features['image/object/bbox/xmin']
-    ymax = features['image/object/bbox/ymax']
-    xmax = features['image/object/bbox/xmax']
-    box = [ymin, xmin, ymax, xmax]
+    label = features['image/class/label']
 
     graph = tf.Graph().as_default()
     ####################
@@ -144,11 +134,12 @@ def main(_):
     image_processed = tf.image.decode_jpeg(image, channels=3)
     image_processed = image_preprocessing_fn(image_processed, image_size, image_size)
 
-    images_processed, images, labels, boxes = tf.train.batch(
-        [image_processed, image, label, box],
+    images_processed, images, labels = tf.train.batch(
+        [image_processed, image, label],
         batch_size=FLAGS.batch_size,
         num_threads=FLAGS.num_preprocessing_threads,
         capacity=5 * FLAGS.batch_size)
+    labels = tf.squeeze(labels)
 
     ####################
     #  Define the model #
@@ -161,90 +152,105 @@ def main(_):
     sess = tf.Session()
     saver.restore(sess, checkpoint_path)
 
+    #evaluator = object_detection_evaluation.ObjectDetectionEvaluator(categories, matching_iou_threshold=0.5)
+    iou = []
+
     with sess:
 
         coord = tf.train.Coordinator()  # 创建一个协调器，管理线程
         threads = tf.train.start_queue_runners(coord=coord)  # 启动QueueRunner, 此时文件名队列已经进队。
         for i in range(FLAGS.max_num_batches):
-            images_, labels_, boxes_, logits_, end_points_ = sess.run([images, labels, boxes, logits, end_points])
+            images_, labels_, logits_, end_points_ = sess.run([images, labels, logits, end_points])
 
             for j in range(FLAGS.batch_size):
-                idx = i * FLAGS.max_num_batches + j
-                image_ = images_[j]
-                image_ = Image.open(BytesIO(image_), 'r')
-                image_np = np.array(image_)
+                idx = i * FLAGS.batch_size + j
+                if j == 0:
+                    image_ = images_[j]
+                    image_ = Image.open(BytesIO(image_), 'r')
+                    image_.save(os.path.join(FLAGS.output_file, 'test_{0}_label_{1}.jpg'.format(i, labels_[j])))
+                    image_np = np.array(image_)
 
-                logit_value = logits_[j]
-                feature_maps_A = end_points_['features_A'][j]
+                    logit_value = logits_[j]
+                    feature_maps_A = end_points_['features_A'][j]
 
-                softmax = np.exp(logit_value) / np.sum(np.exp(logit_value), axis=0)
+                    softmax = np.exp(logit_value) / np.sum(np.exp(logit_value), axis=0)
 
-                n_top = 1
-                predictions = np.argsort(-logit_value)[:n_top]
-                scores = -np.sort(-softmax)[:n_top]
+                    n_top = 1
+                    predictions = np.argsort(-logit_value)[:n_top]
+                    scores = -np.sort(-softmax)[:n_top]
 
-                classes_ = [labels_[j]]
-                boxes_ = [boxes_[j]]
-                print(predictions)
-                print(scores)
-                print(classes_)
+                    print(predictions)
+                    print(scores)
+                    print(labels_[j])
 
-                # 生成heatmap
-                cam = cam_utils.CAMmap(feature_maps_A, logit_value, n_top)
-                for k in range(n_top):
-                    fm = cam[:, :, k]
-                    cam[:, :, k] = (fm - fm.min()) / (fm.max() - fm.min())
-                im_height = image_np.shape[0]
-                im_width = image_np.shape[1]
+                    # 生成heatmap
+                    cam_A = cam_utils.CAMmap(feature_maps_A, logit_value, n_top)
+                    cam_B = cam_utils.CAMmap(feature_maps_B, logit_value, n_top)
+                    for k in range(n_top):
+                        fm_a = cam_A[:, :, k]
+                        cam_A[:, :, k] = (fm_a - fm_a.min())/(fm_a.max() - fm_a.min())
+                        fm_b = cam_B[:, :, k]
+                        cam_B[:, :, k] = (fm_b - fm_b.min())/(fm_b.max() - fm_b.min())
+                    cam = np.maximum(cam_A, cam_B)
+                    im_height = image_np.shape[0]
+                    im_width = image_np.shape[1]
 
-                # 保存heatmap
-                cam_resize = np.zeros((im_height, im_width, n_top))
-                for k in range(n_top):
-                    heatmap_resize = Image.fromarray(cam[:, :, k]).resize((im_width, im_height),Image.BILINEAR)
-                    cam_resize[:, :, k] = np.array(heatmap_resize)
-                    heatmap = cam_utils.grey2rainbow(cam_resize[:, :, k] * 255)
-                    heatmap = Image.fromarray(heatmap)
-                    heatmap.save(os.path.join(FLAGS.output_file, 'test_{0}_heatmap_{1}.jpg'.format(idx, k)))
+                    # 保存heatmap
+                    cam_resize = np.zeros((im_height, im_width, n_top))
+                    for k in range(n_top):
+                        heatmap_resize = Image.fromarray(cam[:, :, k]).resize((im_width, im_height), Image.BILINEAR)
+                        cam_resize[:, :, k] = np.array(heatmap_resize)
+                        heatmap = cam_utils.grey2rainbow(cam_resize[:, :, k] * 255)
+                        heatmap = Image.fromarray(heatmap)
+                        heatmap.save(os.path.join(FLAGS.output_file, 'test_{0}_heatmap_{1}.jpg'.format(i, k)))
 
-                # 生成bounding_boxes
-                threshold = 0.65
-                boxes = cam_utils.bounding_box(cam_resize, threshold)
+                    # 生成bounding_boxes
+                    threshold = 0.75
+                    boxes = cam_utils.bounding_box(cam_resize, threshold)
 
-                # 输出检测结果
-                vis_util.visualize_boxes_and_labels_on_image_array(
-                    image_np,
-                    boxes,
-                    predictions.astype(np.int32),
-                    scores,
-                    category_index,
-                    use_normalized_coordinates=True,
-                    min_score_thresh=0.01,
-                    line_thickness=5)
-                plt.imsave(os.path.join(FLAGS.output_file, 'test_{0}_output.jpg'.format(idx)), image_np)
+                    # 输出检测结果
+                    vis_util.visualize_boxes_and_labels_on_image_array(
+                        image_np,
+                        boxes,
+                        predictions.astype(np.int32),
+                        scores,
+                        category_index,
+                        use_normalized_coordinates=True,
+                        min_score_thresh=0.001,
+                        line_thickness=5)
+                    plt.imsave(os.path.join(FLAGS.output_file, 'test_{0}_output.jpg'.format(i)), image_np)
 
-                '''
-                # 计算评价指标
-                boxes_, classes_ = cam_utils.get_boxes(FLAGS.annotations_dir, i)
-                for k in boxes.shape[0]:
-                    boxes[i, 0] = boxes[i, 0] * im_height
-                    boxes[i, 1] = boxes[i, 1] * im_width
-                    boxes[i, 2] = boxes[i, 2] * im_height
-                    boxes[i, 3] = boxes[i, 3] * im_width
-                
-        
-                result_dict = {}
-                result_dict[standard_fields.InputDataFields.groundtruth_boxes] = boxes_
-                result_dict[standard_fields.InputDataFields.groundtruth_classes] = classes_
-                result_dict[standard_fields.DetectionResultFields.detection_boxes] = boxes
-                result_dict[standard_fields.DetectionResultFields.detection_scores] = scores
-                result_dict[standard_fields.DetectionResultFields.detection_classes] = classes
-                evaluator.add_single_ground_truth_image_info(image_id=i, groundtruth_dict=result_dict)
-                evaluator.add_single_detected_image_info(image_id=i, detections_dict=result_dict)
-        
-            metrics = evaluator.evaluate()
-            for key in metrics:
-                print(metrics[key])
-                '''
+                    # 计算评价指标
+                    annotations_dir = os.path.join(FLAGS.dataset_dir, 'test_data/annotations')
+                    boxes_, classes_ = cam_utils.get_boxes(annotations_dir, i)
+                    for k in range(boxes.shape[0]):
+                        boxes[k, 0] = boxes[k, 0] * im_height
+                        boxes[k, 1] = boxes[k, 1] * im_width
+                        boxes[k, 2] = boxes[k, 2] * im_height
+                        boxes[k, 3] = boxes[k, 3] * im_width
+
+                    if predictions[0] == labels_[j]:
+                        iou_ = np_box_ops.iou(boxes, boxes_)[0][0]
+                        iou.append(iou_)
+
+                    '''
+                    result_dict = {}
+                    result_dict[fields.InputDataFields.groundtruth_boxes] = boxes_
+                    result_dict[fields.InputDataFields.groundtruth_classes] = classes_
+                    result_dict[fields.DetectionResultFields.detection_boxes] = boxes
+                    result_dict[fields.DetectionResultFields.detection_scores] = scores
+                    result_dict[fields.DetectionResultFields.detection_classes] = classes
+                    evaluator.add_single_ground_truth_image_info(image_id=i, groundtruth_dict=result_dict)
+                    evaluator.add_single_detected_image_info(image_id=i, detections_dict=result_dict)
+
+        metrics = evaluator.evaluate()
+        for key in metrics:
+            print(metrics[key])
+        '''
+
+        mean_iou = np.array(iou).mean()
+        print(mean_iou)
+
         coord.request_stop()
         coord.join(threads)
 
